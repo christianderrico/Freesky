@@ -1,175 +1,304 @@
-# freesky
+<div align="center">
 
-**Like SkyPilot, but only free GPUs.** Describe a job (or an endpoint) once; freesky runs it on whichever free tier has capacity right now — Modal, Kaggle, Colab, Lightning AI, Beam, cloud trial credits, your own machine — and fails over to the next one when a provider is out of GPUs, out of quota or logged out. Like OmniRoute does for LLM APIs, for GPU compute.
+# ☁️ freesky
 
-Illustrative run of a 40-hour job on free tiers:
+**Like SkyPilot, but only free GPUs.**
+
+Write a job once. freesky runs it on whichever free GPU tier has room right now —<br>
+Modal, Kaggle, Colab, Lightning AI, Beam, cloud trial credits or your own machine —<br>
+and moves on to the next one when a provider is full, out of quota or logged out.
+
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)
+![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)
+
+[Why](#why-freesky) · [Quickstart](#quickstart) · [Jobs](#jobs) · [Long jobs](#jobs-longer-than-any-free-session) · [Endpoints](#endpoints-on-free-gpus) · [Providers](#providers) · [How it works](#how-it-works) · [FAQ](#faq)
+
+</div>
+
+---
+
+## Why freesky
+
+There is a surprising amount of free GPU compute in the world: $30 a month on Modal, about 30 hours a week on Kaggle, a T4 on Colab when one is free, monthly credits on Lightning AI, hundreds of dollars of cloud trial credit. The catch is that it is scattered. Every provider has its own CLI, its own quota, its own session limit and its own bad days.
+
+freesky treats all of it as **one pool**:
+
+| You want to… | freesky does |
+|---|---|
+| run a script on a GPU | picks the provider that can start soonest and has quota left, ships your code, brings outputs back |
+| not babysit failures | when a provider has no GPU, is out of quota or rejects your login, it cools that provider down and tries the next |
+| train for 40 hours on 12-hour sessions | splits the run at each session limit, saves your checkpoint, resumes on the next free provider |
+| call a model from your app | serves it behind a local URL, starts it on demand, stops it when idle, moves it if it dies |
+| know what is left | tracks hours, dollars and credits per provider in one ledger and a small dashboard |
+
+It is the same idea as [OmniRoute](https://github.com/diegosouzapw/OmniRoute) (one endpoint, many free LLM providers, automatic failover), applied to GPU compute.
+
+## Quickstart
+
+```bash
+git clone https://github.com/christianderrico/Freesky && cd Freesky
+pip install -e '.[modal,kaggle]'      # add the extras for the providers you use
+
+freesky init                          # writes ~/.freesky/config.yaml
+modal setup                           # log in to the providers you want, with your own accounts
+kaggle auth login
+
+freesky providers                     # what is ready on this machine
+freesky launch examples/hello-gpu/task.yaml
+```
+
+`hello-gpu` reports which provider and GPU it landed on; outputs and logs end up in `freesky-runs/`.
+
+## Jobs
+
+A job is a small YAML file, in the spirit of a SkyPilot task:
+
+```yaml
+name: finetune
+resources:
+  accelerator: any            # none | T4 | P100 | L4 | A10G | A100 | H100 | any
+  min_gpu_memory_gb: 16
+  max_runtime: 2h
+  estimated_runtime: 45m      # used to estimate how much free quota the job will use
+image: python:3.12-slim       # for container-based providers (Modal, Beam)
+workdir: .                    # shipped to the provider (up to 30 MB)
+setup: pip install -r requirements.txt
+run: python train.py
+outputs: [out]                # copied back to freesky-runs/<job>-<time>-<provider>/outputs/
+env: {HF_HOME: /tmp/hf}
+providers: [modal, kaggle, colab, lightning, local]   # optional: allow-list and order
+```
+
+```bash
+freesky plan finetune.yaml       # which providers would be tried, in which order, and why others are skipped
+freesky launch finetune.yaml     # run it
+```
+
+`plan` explains every decision (example output):
 
 ```
-$ freesky launch examples/resumable-training/task.yaml
-task resumable-training: any, max 144000s, resumable via ckpt/ (policy fastest)
-  -> modal        T4, ~0.12 usd of 29.41 left
-  -> lightning    T4, ~2.31 credits of 14.20 left
-  -> colab        T4, ~11.00 hours of 12.00 left
-  -> kaggle       T4, ~11.73 hours of 25.50 left
+task finetune: any, max 7200s (policy fastest)
+  -> modal        T4, ~0.45 usd of 29.41 left
+  -> colab        T4, ~0.77 hours of 12.00 left
+  -> kaggle       T4, ~0.82 hours of 25.50 left
+     lightning    cooling down for 12 min (capacity: no GPU available)
+     local        no suitable GPU (any, >= 16 GB)
+```
+
+If your own command fails, freesky stops there: it does not burn another provider's quota on an error that would happen again.
+
+## Jobs longer than any free session
+
+Free sessions end: Kaggle after 12 hours, Colab after about 12, free Lightning Studios every 4. Add one line to your job:
+
+```yaml
+checkpoint: ckpt
+```
+
+and freesky runs it as a chain of segments. Near the end of each session it sends your process `SIGTERM`, waits for it to save, brings `ckpt/` back, and starts the next segment on whichever provider is free — the same one or a different one (example output):
+
+```
 > trying lightning (T4), segment 1, deadline 13800s
   segment 1 reached its deadline on lightning; checkpoint saved
 > segment 2: resuming from the checkpoint
 > trying kaggle (T4), segment 2, deadline 42600s
 ...
 segments: lightning -> kaggle -> colab -> kaggle
-OK on kaggle (Tesla T4) in 143212s -> freesky-runs/resumable-training-20261119-150416-seg4-kaggle
 ```
 
-## What it does
+Your code only has to follow a simple contract:
 
-- **Jobs** — one task YAML for every provider; outputs, logs and exit code come back to `freesky-runs/`.
-- **Jobs longer than any free session** — add `checkpoint: ckpt`. freesky splits the run at each provider's session limit (Kaggle 12 h, Colab ~12 h, Lightning 4 h), sends SIGTERM so your code can save, brings the checkpoint back and resumes on whichever provider is free next.
-- **Endpoints on free GPUs** — `freesky serve` gives you a local URL backed by one warm replica (Modal tunnels, Beam ports, or local). It starts on the first request, stops after `idle_timeout` so credit is only spent while used, and moves to another provider if the replica dies.
-- **One quota pool** — a ledger of hours / dollars / credits per provider and window (day, week, month, one-off). Real remaining quota is read where the provider exposes it (Kaggle). Failing providers cool down with backoff by error kind (no capacity, quota, auth, transient).
-- **Policies** — `fastest` (shortest start), `save-scarce` (spend the most abundant quota first), `order` (yours).
-- **Never leaks a GPU** — sandboxes, sessions, studios and VMs are torn down at the end, including on errors.
-- **Dashboard and agents** — `freesky dashboard` shows free compute left everywhere; `freesky mcp` lets Claude Code and other agents plan and launch jobs on free GPUs.
-- **World catalog** — `freesky providers` lists 23 free GPU sources across the US, Europe and China with their status.
-
-## How it compares
-
-| | freesky | omnirun | SkyPilot |
-|---|---|---|---|
-| Focus | free tiers only | your clusters + free notebooks + marketplaces | paid clouds and Kubernetes |
-| Modal, Lightning, Beam, cloud trial credits | yes | no | trials via its cloud backends |
-| Resume across providers past session limits | yes (`checkpoint:`) | no (non-goal) | managed-job recovery from spot preemption |
-| Endpoints with scale to zero + failover | yes (`serve`) | no | SkyServe (paid clouds) |
-| Failover on a direct launch | yes | queue mode only | yes |
-| Needs a pushed git commit | no (ships the workdir) | yes | no |
-| Dashboard / agent integration | yes / MCP server | no / agent skill | yes / agent skill |
-
-omnirun is excellent for research clusters (Slurm, SSH) and has a far more battle-tested scheduler; use it there. freesky is for getting real work done for $0.
-
-## Install
-
-```bash
-pip install -e '.[all]'          # or pick extras: modal, kaggle, colab, lightning, beam, skypilot, mcp
-freesky init                     # writes ~/.freesky/config.yaml
-freesky providers                # what is ready on this machine
+```python
+ckpt = os.environ["FREESKY_CHECKPOINT_DIR"]
+state = load(ckpt) if os.environ["FREESKY_RESUME"] == "1" else fresh()
+signal.signal(signal.SIGTERM, lambda *_: (save(state, ckpt), sys.exit(0)))
+for step in range(state.step, total):
+    train_step(); maybe_save(state, ckpt)       # periodic saves also cover hard preemption
 ```
 
-Log in once per provider, **with your own account** (free tiers are personal; sharing one account breaks their terms):
+A full example lives in [`examples/resumable-training`](examples/resumable-training).
 
-| Provider | Login |
-|---|---|
-| Modal | `modal setup` |
-| Kaggle | `kaggle auth login` (then `oauth: true` in the config) or `KAGGLE_API_TOKEN` |
-| Colab | `gcloud auth application-default login --scopes=openid,https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email,https://www.googleapis.com/auth/colaboratory` and `auth: adc` in the config |
-| Lightning | `LIGHTNING_USER_ID`, `LIGHTNING_API_KEY` (Settings → Keys) and `teamspace:` in the config |
-| Beam | `beam configure` |
-| Cloud trials | `pip install 'skypilot[gcp]' && sky check`, then one `type: skypilot` entry per account |
+## Endpoints on free GPUs
 
-## Jobs
-
-```yaml
-name: train
-resources:
-  accelerator: any            # none | T4 | P100 | L4 | A10G | A100 | H100 | any
-  min_gpu_memory_gb: 16
-  max_runtime: 40h            # total budget across segments
-  estimated_runtime: 40h      # used to estimate quota use
-image: python:3.12-slim       # container-based providers (Modal, Beam)
-workdir: .                    # shipped to the provider (up to 30 MB; download big data in setup)
-setup: pip install -r requirements.txt
-run: python train.py
-outputs: [out]
-checkpoint: ckpt              # optional: resume across sessions and providers
-env: {HF_HOME: /tmp/hf}
-providers: [modal, kaggle, colab, lightning, local]   # optional allow-list and order
-```
-
-Your code sees `FREESKY_PROVIDER`, `FREESKY_SEGMENT`, `FREESKY_CHECKPOINT_DIR` and `FREESKY_RESUME`. For resumable jobs: load state from the checkpoint dir if it exists, save periodically and on SIGTERM. See `examples/resumable-training/train.py`.
-
-```bash
-freesky plan task.yaml           # order of providers, and why the others are skipped
-freesky launch task.yaml         # run with failover (and resume)
-freesky quota                    # free quota used / left
-freesky history                  # past attempts
-freesky reset [provider]         # clear cooldowns
-```
-
-## Endpoints
+Some models are not batch jobs: you want to call them. Add a `service` block:
 
 ```yaml
 name: kev-endpoint
 resources: {accelerator: any, min_gpu_memory_gb: 16}
-setup: ...
+setup: ...                           # install the model server
 run: python -m kev.serve --host 0.0.0.0 --port 8009
 service:
   port: 8009
-  health: /v1/models          # any answer below 500 counts as up
-  ready_timeout: 25m
+  health: /v1/models
   idle_timeout: 10m
 providers: [modal, beam, local]
 ```
 
 ```bash
-freesky serve examples/kev-endpoint/task.yaml --port 9000 [--warm]
-curl localhost:9000/v1/systemone -d '{...}'
-curl localhost:9000/_freesky/status
+freesky serve examples/kev-endpoint/task.yaml --port 9000
+curl localhost:9000/v1/systemone -d '{...}'      # your app talks to localhost
+curl localhost:9000/_freesky/status               # where the replica runs, uptime, history
 ```
 
-Only providers whose free tier allows exposing a port are used for endpoints (Modal, Beam, local). Colab and Kaggle are batch-only. **Modal and Beam endpoint URLs are public**: anyone with the URL can call your model while the replica runs — put your own auth in the server if that matters.
+- **Scale to zero**: nothing runs until the first request (or `--warm`).
+- **Idle shutdown**: after `idle_timeout` without traffic the replica stops, so credit is spent only while you use it.
+- **Failover**: if the replica dies or stops answering its health check, that provider cools down and a new replica starts elsewhere; the request is retried once.
 
-## Dashboard and MCP
+Endpoints use only providers whose free tier allows exposing a port: Modal (encrypted tunnels), Beam (exposed ports) and your own machine.
+
+## Providers
+
+| Provider | Free offer | Jobs | Endpoints | Session limit | Status |
+|---|---|:-:|:-:|---|---|
+| **local** | your own GPU or CPU | ✓ | ✓ | – | supported |
+| **Modal** | $30 / month credit, T4 to H100 | ✓ | ✓ | 24 h | supported |
+| **Kaggle** | ~30 GPU-hours / week, T4 ×2 | ✓ | | 12 h | supported |
+| **Colab** | T4 when available | ✓ | | ~12 h | supported |
+| **Lightning AI** | monthly free credits | ✓ | | 4 h | supported |
+| **Beam** | free signup hours | ✓ | ✓ | – | experimental |
+| **GCP / Azure / OCI / AWS trials** | $100–$300 of trial credit, via SkyPilot | ✓ | | – | experimental |
+
+`freesky providers -v` shows the full **world catalog** of 23 free GPU sources, including ones without a job API (Baidu AI Studio, ModelScope, Tianchi, Intel Tiber AI Cloud, Saturn Cloud…) and closed ones (SageMaker Studio Lab), with notes on each. Free tiers change often: every limit is an estimate you can override in the config.
+
+### Configuration
+
+```yaml
+# ~/.freesky/config.yaml
+policy: fastest            # fastest | save-scarce | order
+
+providers:
+  modal: {}
+  kaggle: {oauth: true}
+  colab: {auth: adc, quota_limit: 12}
+  lightning: {teamspace: my-teamspace}
+  beam: {}
+  local: {allow_cpu_fallback: true}
+  gcp-trial:               # one entry per credit account
+    type: skypilot
+    quota_limit: 300
+    quota_window: total
+    resources: {infra: gcp}
+```
+
+| Policy | Picks first |
+|---|---|
+| `fastest` | the provider that starts soonest (local GPU, then serverless, then notebooks) |
+| `save-scarce` | the provider with the largest share of its quota left, saving the scarce ones for later |
+| `order` | the order of your config, or of the job's `providers:` list |
+
+<details>
+<summary><b>Logging in to each provider</b></summary>
+
+| Provider | How |
+|---|---|
+| Modal | `modal setup` |
+| Kaggle | `kaggle auth login` (then `oauth: true`), or `KAGGLE_API_TOKEN` |
+| Colab | `gcloud auth application-default login --scopes=openid,https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email,https://www.googleapis.com/auth/colaboratory`, then `auth: adc` |
+| Lightning | `LIGHTNING_USER_ID` and `LIGHTNING_API_KEY` from Settings → Keys, plus `teamspace:` |
+| Beam | `beam configure` |
+| Cloud trials | `pip install 'skypilot[gcp]' && sky check` |
+
+</details>
+
+## Dashboard and coding agents
 
 ```bash
-freesky dashboard                       # http://127.0.0.1:8790
-claude mcp add freesky -- freesky mcp   # tools: list_providers, quota, plan, launch, history
+freesky dashboard                         # http://127.0.0.1:8790
 ```
+
+One page with the free compute left across providers, which ones are ready or cooling down, recent runs and the world catalog.
+
+```bash
+claude mcp add freesky -- freesky mcp     # or any MCP-capable agent
+```
+
+The MCP server gives agents five tools — `list_providers`, `quota`, `plan`, `launch`, `history` — so you can say *"train this on a free GPU"* and let the agent pick, run and report where it ran.
 
 ## How it works
 
-Every provider runs the same generated **Python driver**: it carries the workdir, runs `setup` and `run` with bash in their own process group, enforces the segment deadline (SIGTERM, then SIGKILL after a grace period), and packs outputs, checkpoint, log and `fgpu_result.json` into one archive. Adapters only have to upload a file, run Python, and download a file.
-
-| Provider | Batch | Endpoint | Mechanism |
-|---|---|---|---|
-| `local` | ✓ | ✓ | subprocess; GPU detected with `nvidia-smi`; optional CPU fallback |
-| `modal` | ✓ | ✓ | `modal.Sandbox` + filesystem API; endpoints through encrypted tunnels |
-| `kaggle` | ✓ | | private script kernel (`kernels push`, T4), big workdirs via a private dataset, real quota via `quota_view` |
-| `colab` | ✓ | | official Colab CLI: `new --gpu T4`, `upload`, `exec`, `download`, `stop` |
-| `lightning` | ✓ | | `lightning_sdk.Studio`: start, upload, `run_with_exit_code`, download, stop |
-| `beam` | ✓ | ✓ | `beam.Sandbox`: fs upload/download, `process.exec`, `expose_port` (experimental) |
-| `skypilot` | ✓ | | `sky launch` on any cloud with trial credit, `rsync`, `sky down` (experimental) |
-
-## World catalog (November 2026)
-
-| Status | Providers |
-|---|---|
-| **supported** | local, Modal ($30/month), Kaggle (~30 GPU-h/week), Colab (T4 when available), Lightning AI (monthly credits) |
-| **experimental** | Beam (signup hours), cloud trials via SkyPilot: GCP ($300/90 d), Azure ($200/30 d), OCI ($300/30 d), AWS Free Tier |
-| **planned** | Hugging Face ZeroGPU, Inferless, Cerebrium, Baseten |
-| **manual** (no job API) | Saturn Cloud, Intel Tiber AI Cloud, Paperspace, Baidu AI Studio, ModelScope, Tianchi, Google TPU Research Cloud, GitHub Student Pack |
-| **closed** | SageMaker Studio Lab (closed to new users since 2026-07-30) |
-
-Free tiers change often; default limits are estimates you can override per provider (`quota_limit`, `rates`, `session_limit`).
-
-## Rules
-
-freesky uses each free tier the way its provider intends: script jobs started and stopped with official tools, no always-on services on free notebooks, no mining, **one account per person per provider**. Trial credits are real money: freesky always tears VMs down, but check your console.
-
-## Status
-
-v0.2. The core (spec, ledger, router, segments and resume, endpoints and failover, CLI, dashboard, MCP) is tested end to end with real execution locally. The Modal, Kaggle, Colab, Lightning and Beam adapters are written against the current SDKs (modal 1.6, kaggle 2.2, lightning-sdk 2026.11, google-colab-cli 0.8, beam-client 0.2) and tested against simulators that really execute the driver — **not yet against real accounts**. SkyPilot is experimental.
-
-Next: real-account test matrix, real quota readers for Modal and Lightning, HF ZeroGPU adapter, periodic checkpoint sync during a segment (to survive hard preemption), more than one replica per endpoint.
-
-```bash
-pip install -e '.[dev]' && pytest
+```mermaid
+flowchart LR
+    Y[task.yaml] --> P[plan]
+    C[config + ledger] --> P
+    P -->|ranked candidates| R{router}
+    R -->|try| M[Modal]
+    R -->|try| K[Kaggle]
+    R -->|try| CO[Colab]
+    R -->|try| L[Lightning]
+    R -->|try| O[local / Beam / trials]
+    M & K & CO & L & O -->|fgpu_out.tgz| U[outputs + checkpoint + log]
+    U -->|deadline hit: next segment| R
+    U --> D[freesky-runs/]
 ```
 
-## Sources for the catalog
+1. **Plan.** For each provider freesky checks: is there a GPU that fits? Are credentials present? Is it cooling down after a failure? Is there enough quota left for the estimated runtime plus start-up time? Candidates are ranked by the policy.
+2. **Run.** Every provider executes the same generated **Python driver**. It carries your workdir, runs `setup` and `run` in their own process group, enforces the segment deadline (`SIGTERM`, then `SIGKILL` after a grace period), and packs outputs, checkpoint, log and a result file into one archive. An adapter only needs to *upload a file, run Python, download a file*, which keeps each one around 100–150 lines.
+3. **Account.** Every attempt goes into a local ledger (`~/.freesky/ledger.jsonl`) with time and cost in the provider's own unit. Quota windows (day, week, month, one-off) are computed from it, unless the provider reports its real quota (Kaggle does). Failures put the provider on a cooldown that depends on the error — no capacity: 15 min, quota: 6 h, login: a day — and doubles on repeated failures.
+4. **Clean up.** Sandboxes, notebook sessions, studios and VMs are always stopped at the end, including after errors, so nothing keeps eating your free credit.
 
-- Modal pricing (Starter, $30/month): https://modal.com/pricing
-- Colab CLI: https://github.com/googlecolab/google-colab-cli
-- Kaggle API (kernels, quota): https://github.com/Kaggle/kaggle-api
-- Free tier overviews 2026: https://aimultiple.com/free-cloud-gpu, https://gpuperhour.com/blog/free-cloud-gpus-and-credits, https://amitpandeytiktok.github.io/awesome-free-compute-2026/compute.html
-- SageMaker Studio Lab closing: https://dev.to/billiem/free-compute-worth-claiming-in-august-2026-154d
-- omnirun: https://github.com/flyingleafe/omnirun
+| Provider | Mechanism |
+|---|---|
+| local | subprocess; GPU detected with `nvidia-smi` |
+| Modal | `modal.Sandbox` + filesystem API; endpoints through encrypted tunnels |
+| Kaggle | private script kernel (`kernels push` with a T4), larger workdirs via a private dataset, quota via `quota_view` |
+| Colab | Google's official Colab CLI: `new --gpu T4`, `upload`, `exec`, `download`, `stop` |
+| Lightning | `lightning_sdk.Studio`: start, upload, `run_with_exit_code`, download, stop |
+| Beam | `beam.Sandbox`: file upload/download, `process.exec`, `expose_port` |
+| Trial credits | SkyPilot: `sky launch`, `rsync`, `sky down` |
 
-License: Apache-2.0.
+## How it compares
+
+| | **freesky** | [omnirun](https://github.com/flyingleafe/omnirun) | [SkyPilot](https://github.com/skypilot-org/skypilot) |
+|---|---|---|---|
+| Made for | free tiers only | your clusters, free notebooks, GPU marketplaces | paid clouds and Kubernetes |
+| Modal, Lightning, Beam, trial credits | ✓ | – | trials via its cloud backends |
+| Resume past session limits, across providers | ✓ | – (non-goal) | managed-job recovery from spot preemption |
+| Endpoints with scale-to-zero and failover | ✓ | – | SkyServe |
+| Failover on a direct launch | ✓ | queue mode | ✓ |
+| Ships uncommitted code | ✓ | – (needs a pushed commit) | ✓ |
+| Dashboard / agents | ✓ / MCP server | – / agent skill | ✓ / agent skill |
+
+omnirun has a much more battle-tested scheduler and is the better tool for Slurm and SSH clusters. SkyPilot is the reference for paid multi-cloud. freesky is for getting real work done for $0.
+
+## FAQ
+
+**Can I share one account across users, or create several to stack quotas?**
+No. Free tiers are personal: shared or duplicate accounts break the terms of every provider listed here and get banned. freesky is built around *your* accounts, the same way SkyPilot uses your own cloud credentials.
+
+**Is it really free?**
+Modal, Kaggle, Colab and Lightning are free within their monthly or weekly allowances, and freesky tracks those. Trial credits and Beam hours are one-off. Beyond any allowance the provider bills you, so keep an eye on `freesky quota`.
+
+**Are endpoints private?**
+Not by default. Modal and Beam give public URLs: anyone who has the URL can call your model while the replica is up. Add authentication in your server if that matters.
+
+**What happens on a hard preemption (Colab reclaims the VM mid-run)?**
+The segment fails, the provider cools down and the job resumes elsewhere from the last checkpoint that came back. Save periodically, not only on `SIGTERM`.
+
+**How big can my code be?**
+The workdir is shipped with each run, up to 30 MB. Download datasets and model weights inside `setup` (from Hugging Face, a bucket, a URL).
+
+## Project status
+
+**Alpha (v0.2).** The core — planning, ledger, failover, resumable segments, endpoints, CLI, dashboard, MCP — is covered by 22 tests with real local execution. The Modal, Kaggle, Colab, Lightning and Beam adapters are written against the current SDKs (modal 1.6, kaggle 2.2, lightning-sdk 2026.11, google-colab-cli 0.8, beam-client 0.2) and tested against simulators that really run the driver, **but not yet against real accounts**. Reports from real runs are the most useful contribution right now.
+
+### Roadmap
+
+- [ ] Real-account test matrix for every supported provider
+- [ ] Real quota readers for Modal and Lightning
+- [ ] Hugging Face ZeroGPU adapter
+- [ ] Checkpoint sync during a segment, to lose less on hard preemption
+- [ ] More than one replica per endpoint, and request queueing during cold starts
+
+## Contributing
+
+```bash
+pip install -e '.[dev]'
+pytest
+```
+
+A new provider is one file in [`freesky/providers/`](freesky/providers): implement `available()`, `launch()` (and `serve()` if the free tier allows endpoints), declare its quota, GPUs and session limit, and add a simulator test in `tests/test_adapters.py`. If you know a free GPU source that is missing from the catalog, open an issue with a link to its terms.
+
+## License
+
+[Apache-2.0](LICENSE).
