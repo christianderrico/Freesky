@@ -1,0 +1,25 @@
+# Kev decision model as an endpoint on a free GPU:
+#   freesky serve examples/kev-endpoint/task.yaml --port 9000
+#   curl localhost:9000/v1/systemone -d '{"state": "...", "questions": {...}}'
+# The replica starts on the first request (or now with --warm) and stops after 10 idle minutes.
+name: kev-endpoint
+resources:
+  accelerator: any
+  min_gpu_memory_gb: 16
+image: python:3.12-slim
+env:
+  KEV_MODEL: jaredpalmer/kev-4b
+  KEV_DTYPE: bf16
+setup: |
+  set -e
+  command -v git >/dev/null || (apt-get update -qq && apt-get install -y -qq git curl)
+  git clone -q --depth 1 https://github.com/jaredpalmer/kev /tmp/kev
+  pip install -q uv
+  cd /tmp/kev && uv sync -q --extra serve
+run: cd /tmp/kev && uv run --extra serve python -m kev.serve --run "$KEV_MODEL" --host 0.0.0.0 --port 8009
+service:
+  port: 8009
+  health: /v1/models
+  ready_timeout: 25m        # first start downloads ~8 GB of weights
+  idle_timeout: 10m
+providers: [modal, beam, local]   # providers that can expose an endpoint

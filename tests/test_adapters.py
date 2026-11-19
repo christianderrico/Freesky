@@ -1,6 +1,7 @@
 """Adapters against simulated providers that really execute the driver."""
 import base64
 import datetime as dt
+import importlib.machinery
 import json
 import os
 import shutil
@@ -172,6 +173,7 @@ def install_fake_modal(monkeypatch, tmp_path):
             self.terminated = True
 
     mod = types.ModuleType("modal")
+    mod.__spec__ = importlib.machinery.ModuleSpec("modal", None)
     mod.App = types.SimpleNamespace(lookup=lambda name, create_if_missing=True: f"app:{name}")
     mod.Image = types.SimpleNamespace(from_registry=lambda ref: f"img:{ref}")
     mod.Sandbox = Sandbox
@@ -225,6 +227,7 @@ def test_lightning_adapter(tmp_path, monkeypatch):
             state["stopped"] = True
 
     mod = types.ModuleType("lightning_sdk")
+    mod.__spec__ = importlib.machinery.ModuleSpec("lightning_sdk", None)
     mod.Machine, mod.Studio = Machine, Studio
     monkeypatch.setitem(sys.modules, "lightning_sdk", mod)
     monkeypatch.setenv("LIGHTNING_API_KEY", "k")
@@ -235,3 +238,99 @@ def test_lightning_adapter(tmp_path, monkeypatch):
     assert out.ok, out.message
     assert provider_name_in_output(out) == "lightning"
     assert state["machine"] == "T4" and state["stopped"] and state["init"]["teamspace"] == "ts"
+
+
+def test_modal_serve_uses_tunnel_and_cleans_up(tmp_path, monkeypatch):
+    from freesky.providers.base import ProviderError
+    from freesky.providers.modal_ import ModalProvider
+    created = install_fake_modal(monkeypatch, tmp_path)
+    sys.modules["modal"].Sandbox.tunnels = lambda self: {8009: types.SimpleNamespace(url="https://abc.modal.run/")}
+    sys.modules["modal"].Sandbox.exec = lambda self, *a, **k: None
+    t = task_from_dict({"name": "svc", "run": "python3 -m http.server 8009", "resources": {"accelerator": "L4"},
+                        "service": {"port": 8009}}, base_dir=str(tmp_path))
+    rep = ModalProvider().serve(t, "L4", str(tmp_path))
+    assert rep.url == "https://abc.modal.run" and created["encrypted_ports"] == [8009]
+    rep.stop()
+    assert created["sb"].terminated
+
+    def boom(self):
+        raise RuntimeError("tunnel never came up")
+    sys.modules["modal"].Sandbox.tunnels = boom
+    with pytest.raises(ProviderError):
+        ModalProvider().serve(t, "L4", str(tmp_path))
+    assert created["sb"].terminated          # no half-started GPU sandbox left billing
+
+
+def install_fake_beam(monkeypatch, tmp_path):
+    remote = tmp_path / "beam-vm"
+    remote.mkdir()
+    state = {}
+
+    def m(p):
+        return str(remote) + p[len("/workspace/fgpu"):] if p.startswith("/workspace/fgpu") else p
+
+    class FS:
+        def create_directory(self, p):
+            os.makedirs(m(p), exist_ok=True)
+
+        def upload_file(self, local, rp):
+            shutil.copy(local, m(rp))
+
+        def download_file(self, rp, local):
+            shutil.copy(m(rp), local)
+
+    class Proc:
+        def __init__(self, code, out):
+            self.code, self.stdout = code, types.SimpleNamespace(read=lambda: out)
+
+        def wait(self):
+            return self.code
+
+    class PM:
+        def exec(self, *args, cwd=None, env=None):
+            state["exec_env"] = env
+            code, out = run_driver_in(str(remote), m(args[1]), "/workspace/fgpu")
+            return Proc(code, out)
+
+    class Instance:
+        def __init__(self):
+            self.fs, self.process, self.terminated = FS(), PM(), False
+
+        def expose_port(self, port):
+            return f"https://{port}.beam.example/"
+
+        def terminate(self):
+            self.terminated = True
+            return True
+
+    class Sandbox:
+        def __init__(self, **kw):
+            state["init"] = kw
+
+        def create(self):
+            state["sb"] = Instance()
+            return state["sb"]
+
+    mod = types.ModuleType("beam")
+    mod.__spec__ = importlib.machinery.ModuleSpec("beam", None)
+    mod.Sandbox, mod.Image = Sandbox, lambda base_image=None: f"img:{base_image}"
+    monkeypatch.setitem(sys.modules, "beam", mod)
+    monkeypatch.setenv("BEAM_TOKEN", "t")
+    return state
+
+
+def test_beam_adapter_batch_and_serve(tmp_path, monkeypatch):
+    from freesky.providers.beam_ import BeamProvider
+    state = install_fake_beam(monkeypatch, tmp_path)
+    out = Router([BeamProvider()], Ledger(str(tmp_path / "h")), log=lambda m: None).run(
+        task(tmp_path, "A10G"), out_dir=str(tmp_path / "runs"))
+    assert out.ok, out.message
+    assert provider_name_in_output(out) == "beam"
+    assert state["init"]["gpu"] == "A10G" and state["sb"].terminated
+    t = task_from_dict({"name": "svc", "run": "true", "resources": {"accelerator": "T4"},
+                        "service": {"port": 8009}}, base_dir=str(tmp_path / "wd"))
+    install = state
+    rep = BeamProvider().serve(t, "T4", str(tmp_path))
+    assert rep.url == "https://8009.beam.example" and install["init"]["ports"] == [8009]
+    rep.stop()
+    assert install["sb"].terminated

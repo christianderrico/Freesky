@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "freesky"
-version = "0.1.0"
+version = "0.2.0"
 description = "Like SkyPilot, but only free GPUs: one task YAML, failover across free tiers"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,7 +17,9 @@ kaggle = ["kaggle>=2.2"]
 colab = ["google-colab-cli>=0.8"]
 lightning = ["lightning-sdk"]
 skypilot = ["skypilot"]
-all = ["modal>=1.6", "kaggle>=2.2", "google-colab-cli>=0.8", "lightning-sdk"]
+beam = ["beam-client"]
+mcp = ["mcp>=1.0"]
+all = ["modal>=1.6", "kaggle>=2.2", "google-colab-cli>=0.8", "lightning-sdk", "beam-client", "mcp>=1.0"]
 dev = ["pytest"]
 
 [project.scripts]

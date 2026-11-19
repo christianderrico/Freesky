@@ -42,13 +42,13 @@ class Fake(Provider):
         super().__init__({})
 
     def available(self):
-        return (self._ok, "" if self._ok else "manca token")
+        return (self._ok, "" if self._ok else "no token")
 
-    def launch(self, task, gpu, workdir):
+    def launch(self, task, gpu, workdir, deadline_s=0, segment=1):
         self.calls += 1
         if self.fail:
             raise ProviderError(self.fail, f"{self.name} simulated {self.fail}")
-        src, _ = make_driver(task, self.name, base=workdir)
+        src, _ = make_driver(task, self.name, base=workdir, deadline_s=deadline_s, segment=segment, grace_s=5)
         path = os.path.join(workdir, "d.py")
         open(path, "w").write(src)
         import subprocess
@@ -69,7 +69,7 @@ def test_failover_capacity_then_success(tmp_path, ledger):
     assert data == {"p": "b", "x": "1"}
     # a is now cooling down and skipped by the planner
     plan = r.plan(make_task(tmp_path))
-    assert plan[0].provider.name == "b" and "pausa" in [c for c in plan if c.provider.name == "a"][0].skip
+    assert plan[0].provider.name == "b" and "cooling down" in [c for c in plan if c.provider.name == "a"][0].skip
 
 
 def test_quota_exhausted_is_skipped(tmp_path, ledger):
@@ -79,7 +79,7 @@ def test_quota_exhausted_is_skipped(tmp_path, ledger):
     ledger.record(Attempt(__import__("time").time(), "a", "x", 3600, 0.99, True))
     plan = Router([a, b], ledger, log=lambda m: None).plan(make_task(tmp_path))
     assert plan[0].provider.name == "b"
-    assert "quota insufficiente" in plan[1].skip
+    assert "not enough quota" in plan[1].skip
 
 
 def test_no_suitable_gpu_and_unavailable(tmp_path, ledger):
@@ -87,7 +87,7 @@ def test_no_suitable_gpu_and_unavailable(tmp_path, ledger):
     b = Fake("b", ok=False)
     plan = Router([a, b], ledger, log=lambda m: None).plan(make_task(tmp_path, accelerator="A100"))
     assert all(not c.usable for c in plan)
-    assert "nessuna GPU adatta" in plan[0].skip
+    assert "no suitable GPU" in plan[0].skip
 
 
 def test_task_failure_does_not_failover(tmp_path, ledger):

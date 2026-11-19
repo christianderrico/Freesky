@@ -17,11 +17,16 @@ from typing import Optional
 
 HOME = os.environ.get("FREESKY_HOME") or os.path.join(os.path.expanduser("~"), ".freesky")
 
+
+def home() -> str:
+    """Read at call time so FREESKY_HOME can change (tests, multiple profiles)."""
+    return os.environ.get("FREESKY_HOME") or os.path.join(os.path.expanduser("~"), ".freesky")
+
 # error kinds -> base cooldown seconds (doubled on each consecutive failure, capped)
 COOLDOWN = {
     "capacity": 15 * 60,    # no GPU available right now: try again later
     "quota": 6 * 3600,      # quota exhausted for this window
-    "auth": 24 * 3600,      # credentials missing/expired: needs `freesky check`
+    "auth": 24 * 3600,      # credentials missing/expired: fix the login, then `freesky reset`
     "transient": 2 * 60,    # network blip, 5xx
     "task": 0,              # the user's code failed: not the provider's fault
 }
@@ -57,11 +62,11 @@ class Attempt:
 
 
 class Ledger:
-    def __init__(self, home: str = HOME):
-        self.home = home
-        os.makedirs(home, exist_ok=True)
-        self.ledger_path = os.path.join(home, "ledger.jsonl")
-        self.state_path = os.path.join(home, "state.json")
+    def __init__(self, path: str = ""):
+        self.home = path or home()
+        os.makedirs(self.home, exist_ok=True)
+        self.ledger_path = os.path.join(self.home, "ledger.jsonl")
+        self.state_path = os.path.join(self.home, "state.json")
 
     # ---------------------------------------------------------------- attempts
     def record(self, a: Attempt) -> None:

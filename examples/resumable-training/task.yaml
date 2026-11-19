@@ -1,0 +1,12 @@
+# A job longer than any free session: freesky splits it into segments at each provider's
+# session limit (Kaggle 12 h, Colab ~12 h, Lightning 4 h), brings ckpt/ back and resumes
+# on whichever provider is free next.
+name: resumable-training
+resources:
+  accelerator: any
+  max_runtime: 40h
+  estimated_runtime: 40h
+workdir: .
+run: python3 train.py
+checkpoint: ckpt
+outputs: [out]
