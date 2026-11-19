@@ -1,0 +1,8 @@
+name: hello-gpu
+resources:
+  accelerator: any          # qualsiasi GPU gratuita; con allow_cpu_fallback anche la CPU locale
+  max_runtime: 10m
+  estimated_runtime: 2m
+workdir: .
+run: python3 main.py
+outputs: [out]

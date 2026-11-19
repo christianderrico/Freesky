@@ -1,0 +1,8 @@
+[
+  {"t": "00:00", "text": "Hi everyone, welcome to the channel, today I'll show you my setup and my desk."},
+  {"t": "01:30", "text": "Let's start with networking basics: the TCP/IP model, ports, what happens when you open a connection."},
+  {"t": "04:10", "text": "With nmap we scan the server's ports and see which services are exposed."},
+  {"t": "07:45", "text": "Now let's talk about SQL injection: we put a quote in the login field and watch the database error."},
+  {"t": "11:20", "text": "I recommend this VPN, use my discount code for thirty percent off."},
+  {"t": "13:00", "text": "To prepare for the OSCP certification I recommend Hack The Box and TryHackMe, starting from the basic paths."}
+]

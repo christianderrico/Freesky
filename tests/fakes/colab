@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+"""Fake `colab` CLI: the 'VM' is a local directory, /content is mapped to it."""
+import os, subprocess, sys
+
+REMOTE = os.environ["FAKE_COLAB_ROOT"]
+args = [a for a in sys.argv[1:] if not a.startswith("--auth")]
+if args and args[0] == "--config":
+    args = args[2:]
+cmd, rest = args[0], args[1:]
+log = open(os.path.join(REMOTE, "calls.log"), "a")
+log.write(" ".join(args) + "\n")
+
+
+def m(p):
+    return REMOTE + p[len("/content"):] if p.startswith("/content") else p
+
+
+if cmd == "sessions":
+    print("no sessions")
+elif cmd == "new":
+    if os.environ.get("FAKE_COLAB_NO_GPU") and "--gpu" in rest:
+        print("HTTP 400: accelerator not available", file=sys.stderr); sys.exit(1)
+    print("Allocating runtime... connected.")
+elif cmd == "upload":
+    s = rest.index("-s"); local, remote = rest[s + 2], rest[s + 3]
+    open(m(remote), "wb").write(open(local, "rb").read())
+elif cmd == "exec":
+    f = rest[rest.index("-f") + 1]
+    p = subprocess.run([sys.executable, f], cwd=REMOTE, capture_output=True, text=True,
+                       env=dict(os.environ, FGPU_BASE=REMOTE))
+    sys.stdout.write(p.stdout); sys.stderr.write(p.stderr)
+elif cmd == "download":
+    s = rest.index("-s"); remote, local = rest[s + 2], rest[s + 3]
+    open(local, "wb").write(open(m(remote), "rb").read())
+elif cmd == "stop":
+    print("stopped")

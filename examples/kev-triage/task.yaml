@@ -1,0 +1,20 @@
+# Kev (decision model) on whichever free GPU is available: scores transcript chunks of a video
+# against questions, e.g. "is this segment useful for my goal?". Input: chunks.json, questions.json
+name: kev-triage
+resources:
+  accelerator: any          # Kev-4B: ~8 GB of bf16 weights; on a T4 bf16 is emulated (slower)
+  min_gpu_memory_gb: 16     # for CPU-only runs use KEV_MODEL=jaredpalmer/kev-0.8b
+  max_runtime: 40m
+  estimated_runtime: 12m    # first run downloads ~8 GB of weights
+workdir: .
+env:
+  KEV_MODEL: jaredpalmer/kev-4b
+  KEV_DTYPE: bf16
+setup: |
+  set -e
+  git clone -q --depth 1 https://github.com/jaredpalmer/kev /tmp/kev
+  pip install -q uv
+  cd /tmp/kev && uv sync -q --extra serve
+run: bash run.sh
+outputs: [out]
+providers: [modal, kaggle, colab, lightning, local]

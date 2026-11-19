@@ -1,0 +1,8 @@
+{
+  "useful": {"type": "noul", "instructions": "The viewer's goal is to become a cybersecurity expert starting from zero. Does this video segment teach something useful for that goal?"},
+  "kind": {"type": "choice", "instructions": "What is this video segment?",
+           "criteria": {"lesson": "teaches a technical concept or skill",
+                        "advice": "gives study or career advice",
+                        "sponsor": "advertisement or sponsored content",
+                        "chatter": "greetings, off-topic or unrelated content"}}
+}
